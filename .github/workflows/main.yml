@@ -1,99 +1,84 @@
 name: RDP
 
 'on':
-workflow_dispatch: {}
-
-permissions:
-contents: read
+workflow_dispatch:
 
 jobs:
 secure-rdp:
 runs-on: windows-latest
-timeout-minutes: 360
+timeout-minutes: 3600
 
 steps:
-  - name: Validate Secrets
+  - name: Configure Core RDP Settings
     shell: powershell
-    env:
-      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
     run: |
-      $ErrorActionPreference = "Stop"
+      Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+      Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+      Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+      netsh advfirewall firewall delete rule name="RDP-Tailscale"
+      netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+      Restart-Service -Name TermService -Force
 
-      if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
-        throw "Missing secret: TAILSCALE_AUTH_KEY"
+  - name: Create RDP User with Static Password
+    shell: powershell
+    run: |
+      $password = "admin@123"
+      $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+      if (-not (Get-LocalUser -Name "TOOLBOXLAP" -ErrorAction SilentlyContinue)) {
+          New-LocalUser -Name "TOOLBOXLAP" -Password $securePass -AccountNeverExpires
       }
-
-      if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
-        throw "Missing secret: RDP_PASSWORD"
-      }
-
-      Write-Host "Required secrets are configured."
+      Add-LocalGroupMember -Group "Administrators" -Member "TOOLBOXLAP" -ErrorAction SilentlyContinue
+      Add-LocalGroupMember -Group "Remote Desktop Users" -Member "TOOLBOXLAP" -ErrorAction SilentlyContinue
 
   - name: Install Tailscale
     shell: powershell
     run: |
-      $ErrorActionPreference = "Stop"
-
-      $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-      $installer = Join-Path $env:TEMP "tailscale.msi"
-
-      Invoke-WebRequest -Uri $url -OutFile $installer -ErrorAction Stop
-
-      $msiArgs = "/i `"$installer`" /quiet /norestart"
-      $proc = Start-Process -FilePath "msiexec.exe" -ArgumentList $msiArgs -Wait -PassThru
-
-      Remove-Item $installer -Force -ErrorAction SilentlyContinue
-
-      if ($proc.ExitCode -notin @(0, 3010)) {
-        throw "Tailscale installation failed: $($proc.ExitCode)"
+      $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+      $installerPath = Join-Path $env:TEMP "tailscale.msi"
+      Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+      $arguments = "/i `"$installerPath`" /quiet /norestart"
+      $installProcess = Start-Process -FilePath "msiexec.exe" -ArgumentList $arguments -Wait -PassThru
+      if ($installProcess.ExitCode -ne 0) {
+          throw "Tailscale installation failed: $($installProcess.ExitCode)"
       }
+      Remove-Item $installerPath -Force
 
-      $exe = "$env:ProgramFiles\Tailscale\tailscale.exe"
-
-      if (-not (Test-Path $exe)) {
-        throw "Tailscale executable not found."
-      }
-
-      Write-Host "Tailscale installed successfully."
-
-  - name: Connect Tailscale
+  - name: Establish Tailscale Connection
     shell: powershell
     env:
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
     run: |
-      $ErrorActionPreference = "Stop"
-
-      $exe = "$env:ProgramFiles\Tailscale\tailscale.exe"
-
-      & $exe up "--authkey=$env:TAILSCALE_AUTH_KEY" "--hostname=gh-runner-$env:GITHUB_RUN_ID"
-
-      if ($LASTEXITCODE -ne 0) {
-        throw "Tailscale connection failed."
+      if (-not $env:TAILSCALE_AUTH_KEY) {
+          throw "Add TAILSCALE_AUTH_KEY in GitHub repository Actions secrets."
       }
-
-      $ip = $null
-
-      for ($i = 0; $i -lt 12; $i++) {
-        $result = & $exe ip -4
-
-        if ($LASTEXITCODE -eq 0 -and $result) {
-          $ip = ($result | Select-Object -First 1).Trim()
-          if ($ip) { break }
-        }
-
-        Start-Sleep -Seconds 5
+      $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+      & $tsExe up "--authkey=$env:TAILSCALE_AUTH_KEY" "--hostname=gh-runner-$env:GITHUB_RUN_ID"
+      $tsIP = $null
+      for ($i = 0; $i -lt 10 -and -not $tsIP; $i++) {
+          Start-Sleep -Seconds 5
+          $tsIP = (& $tsExe ip -4 | Select-Object -First 1).Trim()
       }
-
-      if (-not $ip) {
-        throw "Tailscale IPv4 address was not assigned."
+      if (-not $tsIP) {
+          throw "Tailscale IP not assigned."
       }
+      "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
-      Write-Host "Tailscale connection established."
-      Write-Host "Tailscale IP: $ip"
-
-  - name: Complete
+  - name: Verify RDP Accessibility
     shell: powershell
     run: |
-      Write-Host "Setup completed."
-      Write-Host "GitHub-hosted runners are temporary."
+      Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+      $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+      if (-not $testResult.TcpTestSucceeded) {
+          throw "TCP connection to RDP port 3389 failed"
+      }
+      Write-Host "TCP connectivity successful!"
+
+  - name: Maintain Connection
+    shell: powershell
+    run: |
+      Write-Host "RDP address: $env:TAILSCALE_IP"
+      Write-Host "Username: TOOLBOXLAP"
+      while ($true) {
+          Write-Host "[$(Get-Date)] Workflow active"
+          Start-Sleep -Seconds 300
+      }
