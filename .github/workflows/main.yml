@@ -1,7 +1,7 @@
 name: RDP
 
-"on":
-workflow_dispatch:
+'on':
+workflow_dispatch: {}
 
 permissions:
 contents: read
@@ -12,24 +12,7 @@ runs-on: windows-latest
 timeout-minutes: 360
 
 steps:
-  - name: Configure RDP
-    shell: powershell
-    run: |
-      $ErrorActionPreference = "Stop"
-
-      Set-ItemProperty `
-        -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-        -Name 'fDenyTSConnections' -Value 0 -Force
-
-      Set-ItemProperty `
-        -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-        -Name 'UserAuthentication' -Value 1 -Force
-
-      Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
-
-      Write-Host "RDP configured."
-
-  - name: Check Secrets
+  - name: Validate Secrets
     shell: powershell
     env:
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
@@ -47,27 +30,6 @@ steps:
 
       Write-Host "Required secrets are configured."
 
-  - name: Create RDP User
-    shell: powershell
-    env:
-      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-    run: |
-      $ErrorActionPreference = "Stop"
-
-      $username = "TOOLBOXLAP"
-      $securePass = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
-      $user = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
-
-      if (-not $user) {
-        New-LocalUser -Name $username -Password $securePass -Description "RDP account"
-      } else {
-        Set-LocalUser -Name $username -Password $securePass
-      }
-
-      Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
-
-      Write-Host "RDP user is ready."
-
   - name: Install Tailscale
     shell: powershell
     run: |
@@ -84,7 +46,7 @@ steps:
       Remove-Item $installer -Force -ErrorAction SilentlyContinue
 
       if ($proc.ExitCode -notin @(0, 3010)) {
-        throw "Tailscale installation failed: exit code $($proc.ExitCode)"
+        throw "Tailscale installation failed: $($proc.ExitCode)"
       }
 
       $exe = "$env:ProgramFiles\Tailscale\tailscale.exe"
@@ -127,32 +89,11 @@ steps:
         throw "Tailscale IPv4 address was not assigned."
       }
 
-      "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
-
-      Write-Host "Tailscale connected."
-
-  - name: Verify RDP Listener
-    shell: powershell
-    run: |
-      $ErrorActionPreference = "Stop"
-
-      $service = Get-Service -Name TermService
-
-      if ($service.Status -ne "Running") {
-        Start-Service -Name TermService
-      }
-
-      $listener = Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
-
-      if (-not $listener) {
-        throw "RDP is not listening on port 3389."
-      }
-
-      Write-Host "RDP listener is active."
-      Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+      Write-Host "Tailscale connection established."
+      Write-Host "Tailscale IP: $ip"
 
   - name: Complete
     shell: powershell
     run: |
-      Write-Host "Setup checks completed."
+      Write-Host "Setup completed."
       Write-Host "GitHub-hosted runners are temporary."
