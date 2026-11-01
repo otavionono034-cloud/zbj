@@ -1,0 +1,170 @@
+name: RDP
+
+on:
+workflow_dispatch:
+
+permissions:
+contents: read
+
+jobs:
+secure-rdp:
+runs-on: windows-latest
+timeout-minutes: 360
+
+steps:
+  - name: Configure RDP
+    shell: powershell
+    run: |
+      $ErrorActionPreference = "Stop"
+
+      Set-ItemProperty `
+        -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+        -Name 'fDenyTSConnections' -Value 0 -Force
+
+      Set-ItemProperty `
+        -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+        -Name 'UserAuthentication' -Value 1 -Force
+
+      Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
+
+      Write-Host "RDP configured."
+
+  - name: Check Secrets
+    shell: powershell
+    env:
+      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+    run: |
+      $ErrorActionPreference = "Stop"
+
+      if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+        throw "Add TAILSCALE_AUTH_KEY in GitHub Actions secrets."
+      }
+
+      if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+        throw "Add RDP_PASSWORD in GitHub Actions secrets."
+      }
+
+  - name: Create RDP User
+    shell: powershell
+    env:
+      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+    run: |
+      $ErrorActionPreference = "Stop"
+
+      $username = "TOOLBOXLAP"
+      $securePass = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+      $user = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
+
+      if (-not $user) {
+        New-LocalUser `
+          -Name $username `
+          -Password $securePass `
+          -Description "RDP account"
+      } else {
+        Set-LocalUser -Name $username -Password $securePass
+      }
+
+      Add-LocalGroupMember `
+        -Group "Remote Desktop Users" `
+        -Member $username `
+        -ErrorAction SilentlyContinue
+
+      Write-Host "RDP user is ready."
+
+  - name: Install Tailscale
+    shell: powershell
+    run: |
+      $ErrorActionPreference = "Stop"
+
+      $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+      $installer = Join-Path $env:TEMP "tailscale.msi"
+
+      Invoke-WebRequest -Uri $url -OutFile $installer
+
+      $args = "/i `"$installer`" /quiet /norestart"
+      $proc = Start-Process `
+        -FilePath "msiexec.exe" `
+        -ArgumentList $args `
+        -Wait -PassThru
+
+      Remove-Item $installer -Force -ErrorAction SilentlyContinue
+
+      if ($proc.ExitCode -notin @(0, 3010)) {
+        throw "Tailscale installation failed: $($proc.ExitCode)"
+      }
+
+      $exe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+      if (-not (Test-Path $exe)) {
+        throw "Tailscale executable not found."
+      }
+
+      Write-Host "Tailscale installed."
+
+  - name: Connect Tailscale
+    shell: powershell
+    env:
+      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+    run: |
+      $ErrorActionPreference = "Stop"
+
+      $exe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+      & $exe up `
+        --authkey="$env:TAILSCALE_AUTH_KEY" `
+        --hostname="gh-runner-$env:GITHUB_RUN_ID"
+
+      if ($LASTEXITCODE -ne 0) {
+        throw "Tailscale connection failed."
+      }
+
+      $ip = $null
+
+      for ($i = 0; $i -lt 12; $i++) {
+        $result = & $exe ip -4
+
+        if ($LASTEXITCODE -eq 0 -and $result) {
+          $ip = ($result | Select-Object -First 1).Trim()
+          if ($ip) { break }
+        }
+
+        Start-Sleep -Seconds 5
+      }
+
+      if (-not $ip) {
+        throw "Tailscale IPv4 address was not assigned."
+      }
+
+      "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+
+      Write-Host "Tailscale connected."
+
+  - name: Verify RDP Listener
+    shell: powershell
+    run: |
+      $ErrorActionPreference = "Stop"
+
+      $service = Get-Service -Name TermService
+
+      if ($service.Status -ne "Running") {
+        Start-Service -Name TermService
+      }
+
+      $listener = Get-NetTCPConnection `
+        -LocalPort 3389 `
+        -State Listen `
+        -ErrorAction SilentlyContinue
+
+      if (-not $listener) {
+        throw "RDP is not listening on port 3389."
+      }
+
+      Write-Host "RDP listener is active."
+      Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+
+  - name: Complete
+    shell: powershell
+    run: |
+      Write-Host "Setup checks completed."
+      Write-Host "GitHub-hosted runners are temporary."
