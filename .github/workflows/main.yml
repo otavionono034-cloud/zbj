@@ -1,25 +1,23 @@
 name: RDP
 
 'on':
-workflow_dispatch:
+workflow_dispatch: {}
 
 jobs:
 secure-rdp:
 runs-on: windows-latest
-timeout-minutes: 3600
+timeout-minutes: 360
 
 steps:
   - name: Configure Core RDP Settings
     shell: powershell
     run: |
-      Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-      Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
-      Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
-      netsh advfirewall firewall delete rule name="RDP-Tailscale"
+      Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
+      Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0 -Force
+      Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'SecurityLayer' -Value 0 -Force
       netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
-      Restart-Service -Name TermService -Force
 
-  - name: Create RDP User with Static Password
+  - name: Create RDP User
     shell: powershell
     run: |
       $password = "admin@123"
@@ -37,11 +35,10 @@ steps:
       $installerPath = Join-Path $env:TEMP "tailscale.msi"
       Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
       $arguments = "/i `"$installerPath`" /quiet /norestart"
-      $installProcess = Start-Process -FilePath "msiexec.exe" -ArgumentList $arguments -Wait -PassThru
-      if ($installProcess.ExitCode -ne 0) {
-          throw "Tailscale installation failed: $($installProcess.ExitCode)"
+      $p = Start-Process -FilePath "msiexec.exe" -ArgumentList $arguments -Wait -PassThru
+      if ($p.ExitCode -ne 0) {
+          throw "Tailscale install failed: $($p.ExitCode)"
       }
-      Remove-Item $installerPath -Force
 
   - name: Establish Tailscale Connection
     shell: powershell
@@ -49,7 +46,7 @@ steps:
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
     run: |
       if (-not $env:TAILSCALE_AUTH_KEY) {
-          throw "Add TAILSCALE_AUTH_KEY in GitHub repository Actions secrets."
+          throw "Missing repository secret TAILSCALE_AUTH_KEY"
       }
       $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
       & $tsExe up "--authkey=$env:TAILSCALE_AUTH_KEY" "--hostname=gh-runner-$env:GITHUB_RUN_ID"
@@ -59,19 +56,14 @@ steps:
           $tsIP = (& $tsExe ip -4 | Select-Object -First 1).Trim()
       }
       if (-not $tsIP) {
-          throw "Tailscale IP not assigned."
+          throw "Tailscale IP not assigned"
       }
       "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
   - name: Verify RDP Accessibility
     shell: powershell
     run: |
-      Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-      $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-      if (-not $testResult.TcpTestSucceeded) {
-          throw "TCP connection to RDP port 3389 failed"
-      }
-      Write-Host "TCP connectivity successful!"
+      Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
 
   - name: Maintain Connection
     shell: powershell
@@ -79,6 +71,5 @@ steps:
       Write-Host "RDP address: $env:TAILSCALE_IP"
       Write-Host "Username: TOOLBOXLAP"
       while ($true) {
-          Write-Host "[$(Get-Date)] Workflow active"
           Start-Sleep -Seconds 300
       }
