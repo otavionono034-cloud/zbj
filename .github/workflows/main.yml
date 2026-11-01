@@ -1,6 +1,6 @@
 name: RDP
 
-on:
+"on":
 workflow_dispatch:
 
 permissions:
@@ -12,7 +12,7 @@ runs-on: windows-latest
 timeout-minutes: 360
 
 steps:
-  - name: Configure Core RDP Settings
+  - name: Configure RDP
     shell: powershell
     run: |
       $ErrorActionPreference = "Stop"
@@ -27,9 +27,9 @@ steps:
 
       Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
 
-      Write-Host "RDP settings configured with Network Level Authentication."
+      Write-Host "RDP configured."
 
-  - name: Validate Required Secrets
+  - name: Check Secrets
     shell: powershell
     env:
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
@@ -38,11 +38,11 @@ steps:
       $ErrorActionPreference = "Stop"
 
       if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
-        throw "Missing GitHub Actions secret: TAILSCALE_AUTH_KEY"
+        throw "Missing secret: TAILSCALE_AUTH_KEY"
       }
 
       if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
-        throw "Missing GitHub Actions secret: RDP_PASSWORD"
+        throw "Missing secret: RDP_PASSWORD"
       }
 
       Write-Host "Required secrets are configured."
@@ -59,101 +59,79 @@ steps:
       $user = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
 
       if (-not $user) {
-        New-LocalUser `
-          -Name $username `
-          -Password $securePass `
-          -AccountNeverExpires `
-          -Description "RDP account"
+        New-LocalUser -Name $username -Password $securePass -Description "RDP account"
       } else {
         Set-LocalUser -Name $username -Password $securePass
       }
 
-      Add-LocalGroupMember `
-        -Group "Remote Desktop Users" `
-        -Member $username `
-        -ErrorAction SilentlyContinue
+      Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
 
-      if (-not (Get-LocalUser -Name $username)) {
-        throw "RDP user creation failed."
-      }
-
-      Write-Host "RDP user created or updated."
+      Write-Host "RDP user is ready."
 
   - name: Install Tailscale
     shell: powershell
     run: |
       $ErrorActionPreference = "Stop"
 
-      $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-      $installerPath = Join-Path $env:TEMP "tailscale.msi"
+      $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+      $installer = Join-Path $env:TEMP "tailscale.msi"
 
-      Invoke-WebRequest `
-        -Uri $tsUrl `
-        -OutFile $installerPath `
-        -ErrorAction Stop
+      Invoke-WebRequest -Uri $url -OutFile $installer -ErrorAction Stop
 
-      $arguments = "/i `"$installerPath`" /quiet /norestart"
-      $process = Start-Process `
-        -FilePath "msiexec.exe" `
-        -ArgumentList $arguments `
-        -Wait `
-        -PassThru
+      $msiArgs = "/i `"$installer`" /quiet /norestart"
+      $proc = Start-Process -FilePath "msiexec.exe" -ArgumentList $msiArgs -Wait -PassThru
 
-      Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+      Remove-Item $installer -Force -ErrorAction SilentlyContinue
 
-      if ($process.ExitCode -notin @(0, 3010)) {
-        throw "Tailscale MSI installation failed: exit code $($process.ExitCode)"
+      if ($proc.ExitCode -notin @(0, 3010)) {
+        throw "Tailscale installation failed: exit code $($proc.ExitCode)"
       }
 
-      $tailscaleExe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+      $exe = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
-      if (-not (Test-Path $tailscaleExe)) {
-        throw "Tailscale executable not found: $tailscaleExe"
+      if (-not (Test-Path $exe)) {
+        throw "Tailscale executable not found."
       }
 
       Write-Host "Tailscale installed successfully."
 
-  - name: Connect to Tailscale
+  - name: Connect Tailscale
     shell: powershell
     env:
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
     run: |
       $ErrorActionPreference = "Stop"
 
-      $tailscaleExe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+      $exe = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
-      Start-Service -Name Tailscale -ErrorAction SilentlyContinue
-
-      & $tailscaleExe up `
-        --authkey="$env:TAILSCALE_AUTH_KEY" `
-        --hostname="gh-runner-$env:GITHUB_RUN_ID"
+      & $exe up "--authkey=$env:TAILSCALE_AUTH_KEY" "--hostname=gh-runner-$env:GITHUB_RUN_ID"
 
       if ($LASTEXITCODE -ne 0) {
-        throw "Tailscale failed to connect."
+        throw "Tailscale connection failed."
       }
 
-      $tsIP = $null
+      $ip = $null
 
       for ($i = 0; $i -lt 12; $i++) {
-        $ips = & $tailscaleExe ip -4
+        $result = & $exe ip -4
 
-        if ($LASTEXITCODE -eq 0 -and $ips) {
-          $tsIP = ($ips | Select-Object -First 1).Trim()
-          if ($tsIP) { break }
+        if ($LASTEXITCODE -eq 0 -and $result) {
+          $ip = ($result | Select-Object -First 1).Trim()
+          if ($ip) { break }
         }
 
         Start-Sleep -Seconds 5
       }
 
-      if (-not $tsIP) {
-        throw "No Tailscale IPv4 address assigned."
+      if (-not $ip) {
+        throw "Tailscale IPv4 address was not assigned."
       }
 
-      "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+      "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
 
-      Write-Host "Tailscale connection established."
+      Write-Host "Tailscale connected."
 
-  - name: Verify RDP Service
+  - name: Verify RDP Listener
     shell: powershell
     run: |
       $ErrorActionPreference = "Stop"
@@ -164,20 +142,17 @@ steps:
         Start-Service -Name TermService
       }
 
-      $listener = Get-NetTCPConnection `
-        -LocalPort 3389 `
-        -State Listen `
-        -ErrorAction SilentlyContinue
+      $listener = Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
 
       if (-not $listener) {
-        throw "RDP is not listening on TCP port 3389."
+        throw "RDP is not listening on port 3389."
       }
 
-      Write-Host "RDP service is listening on port 3389."
+      Write-Host "RDP listener is active."
       Write-Host "Tailscale IP: $env:TAILSCALE_IP"
 
-  - name: Finish
+  - name: Complete
     shell: powershell
     run: |
-      Write-Host "Configuration and service checks completed."
-      Write-Host "The GitHub-hosted runner is temporary."
+      Write-Host "Setup checks completed."
+      Write-Host "GitHub-hosted runners are temporary."
