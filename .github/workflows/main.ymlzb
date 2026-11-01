@@ -1,0 +1,99 @@
+name: RDP
+
+'on':
+workflow_dispatch: {}
+
+permissions:
+contents: read
+
+jobs:
+secure-rdp:
+runs-on: windows-latest
+timeout-minutes: 360
+
+steps:
+  - name: Validate Secrets
+    shell: powershell
+    env:
+      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+    run: |
+      $ErrorActionPreference = "Stop"
+
+      if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+        throw "Missing secret: TAILSCALE_AUTH_KEY"
+      }
+
+      if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+        throw "Missing secret: RDP_PASSWORD"
+      }
+
+      Write-Host "Required secrets are configured."
+
+  - name: Install Tailscale
+    shell: powershell
+    run: |
+      $ErrorActionPreference = "Stop"
+
+      $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+      $installer = Join-Path $env:TEMP "tailscale.msi"
+
+      Invoke-WebRequest -Uri $url -OutFile $installer -ErrorAction Stop
+
+      $msiArgs = "/i `"$installer`" /quiet /norestart"
+      $proc = Start-Process -FilePath "msiexec.exe" -ArgumentList $msiArgs -Wait -PassThru
+
+      Remove-Item $installer -Force -ErrorAction SilentlyContinue
+
+      if ($proc.ExitCode -notin @(0, 3010)) {
+        throw "Tailscale installation failed: $($proc.ExitCode)"
+      }
+
+      $exe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+      if (-not (Test-Path $exe)) {
+        throw "Tailscale executable not found."
+      }
+
+      Write-Host "Tailscale installed successfully."
+
+  - name: Connect Tailscale
+    shell: powershell
+    env:
+      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+    run: |
+      $ErrorActionPreference = "Stop"
+
+      $exe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+      & $exe up "--authkey=$env:TAILSCALE_AUTH_KEY" "--hostname=gh-runner-$env:GITHUB_RUN_ID"
+
+      if ($LASTEXITCODE -ne 0) {
+        throw "Tailscale connection failed."
+      }
+
+      $ip = $null
+
+      for ($i = 0; $i -lt 12; $i++) {
+        $result = & $exe ip -4
+
+        if ($LASTEXITCODE -eq 0 -and $result) {
+          $ip = ($result | Select-Object -First 1).Trim()
+          if ($ip) { break }
+        }
+
+        Start-Sleep -Seconds 5
+      }
+
+      if (-not $ip) {
+        throw "Tailscale IPv4 address was not assigned."
+      }
+
+      Write-Host "Tailscale connection established."
+      Write-Host "Tailscale IP: $ip"
+
+  - name: Complete
+    shell: powershell
+    run: |
+      Write-Host "Setup completed."
+      Write-Host "GitHub-hosted runners are temporary."
